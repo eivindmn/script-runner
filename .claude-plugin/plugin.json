@@ -1,0 +1,7 @@
+{
+  "name": "script-menu",
+  "version": "0.3.0",
+  "author": { "name": "Eivind Nordengen" },
+  "description": "Finn Python- og shell-scriptene i prosjektet og kjør dem fra et panel, med stjernemerking og svar på input underveis.",
+  "types": "./types/index.d.ts"
+}

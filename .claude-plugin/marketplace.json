@@ -1,0 +1,6 @@
+{
+  "name": "script-runner",
+  "owner": { "name": "Eivind Nordengen" },
+  "description": "Run the Python and shell scripts in your project from a pane in Claude Code.",
+  "plugins": [{ "name": "script-menu", "source": "./" }]
+}
