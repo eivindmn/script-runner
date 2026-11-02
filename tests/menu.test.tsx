@@ -48,18 +48,39 @@ function world(on: On, extra: Record<string, string> = {}) {
     envs: [] as (Record<string, string> | undefined)[],
     answers: [] as string[],
     opened: [] as string[],
+    closed: [] as string[],
+    toasts: [] as string[],
   }
+  const up = new Set<string>()
   on('session.root', () => ({ value: ROOT }))
   on('session.surfaces', () => ({ value: [] }))
   on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('command.register', () => ({ value: { command: 'scripts' } }))
   on('ui.open', (_, e) => {
     seen.opened.push(e.id)
+    up.add(e.id)
 
     return { value: { isPlaced: true } }
   })
+  on('ui.close', (_, e) => {
+    seen.closed.push(e.id)
+    up.delete(e.id)
+
+    return { value: undefined }
+  })
+  on('ui.toast', (_, e) => {
+    seen.toasts.push(String(e.text))
+
+    return { value: undefined }
+  })
+  // The engine's own hint line, beneath the mod's button.
+  on('ui.render', { component: 'PromptHint' }, (t, e) => {
+    const { Text } = t.ui.resolve(e)
+
+    return <Text dimColor>{e.props.hint}</Text>
+  })
   on('ui.panes', () => ({
-    value: [...new Set(seen.opened)].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+    value: [...up].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
   }))
   on('fs.list', (_, e) =>
     e.path === `${ROOT}/pipeline`
@@ -91,6 +112,12 @@ function world(on: On, extra: Record<string, string> = {}) {
   on('process.spawn', async function* (_, e) {
     seen.spawned.push(e.argv)
     seen.envs.push(e.env)
+    // Only the scripts that ask wait for an answer; the rest just finish.
+    if (!e.argv.some(arg => arg === 'scripts/ask.py' || arg === 'scripts/setup.sh' || arg.endsWith('make_sounds.py'))) {
+      yield { stream: 'stdout' as const, text: 'Ferdig\n' }
+
+      return { value: { code: 0, signal: null } }
+    }
     yield { stream: 'stdout' as const, text: 'Hei!\nNavn: ' }
     while (seen.answers.length === 0) await clock.sleep(20)
     yield { stream: 'stdout' as const, text: `Takk ${seen.answers[0]}\n` }
@@ -268,4 +295,76 @@ test('a long list scrolls in a window under the favourites', async ($, on) => {
   await ui.press({ key: 'list-up' })
   expect(await showing()).toEqual(before)
   await ui.unmount()
+})
+
+const HINT = {
+  plugin: 'script-menu',
+  component: 'PromptHint',
+  props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+} as const
+
+test('a button in the hint line under the prompt shows and hides the pane', async ($, on) => {
+  const { clock, seen } = world(on)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const hint = await $.ui.mount({ ...HINT, surface })
+    expect((await hint.find({ key: 'scripts-toggle' }))?.text).toMatch(/Scripts/)
+    // The engine's own line stays beside the button.
+    expect(await hint.find({ type: 'Text', text: /for shortcuts/ })).toBeDefined()
+    await hint.unmount()
+  }
+
+  const hint = await $.ui.mount({ ...HINT, surface: 'desktop' })
+  await hint.press({ key: 'scripts-toggle' })
+  expect(seen.opened).toEqual(['scripts'])
+  await hint.press({ key: 'scripts-toggle' })
+  expect(seen.closed).toEqual(['scripts'])
+
+  // Closed from the button, it is not opened again unasked.
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default', viewport: { columns: 60, rows: 40, isFullscreen: true } })
+  await clock.advance(10)
+  expect(seen.opened).toEqual(['scripts'])
+
+  // A script waiting for an answer shows on the button.
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'rescan' })
+  await pane.press({ key: 'run:scripts/ask.py' })
+  await clock.advance(100)
+  expect(await hint.find({ type: 'Text', text: 'venter på svar' })).toBeDefined()
+  await pane.input({ key: 'answer', text: 'ok' })
+  await clock.advance(100)
+  await pane.unmount()
+  await hint.unmount()
+})
+
+test('the favourites sit under the prompt as buttons that run them', async ($, on) => {
+  const { clock, seen } = world(on)
+  const hint = await $.ui.mount({ ...HINT, surface: 'desktop' })
+  // The line's first drawing scans, so no favourite shows before one is starred.
+  await clock.advance(10)
+  expect(await hint.find({ key: 'quick:scripts/deploy.py' })).toBeUndefined()
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'star:scripts/deploy.py' })
+  await pane.press({ key: 'star:scripts/ask.py' })
+  await pane.unmount()
+  expect((await hint.find({ key: 'quick:scripts/deploy.py' }))?.text).toMatch(/▶ deploy\.py/)
+
+  // One that asks nothing runs out of sight and says how it ended.
+  await hint.press({ key: 'quick:scripts/deploy.py' })
+  await clock.advance(100)
+  expect(seen.spawned.at(-1)?.slice(-1)).toEqual(['scripts/deploy.py'])
+  expect(seen.opened).toEqual([])
+  expect(seen.toasts).toEqual(['deploy.py er ferdig'])
+  expect((await hint.find({ key: 'quick:scripts/deploy.py' }))?.text).toMatch(/✓ deploy\.py/)
+
+  // One that asks for input opens the pane on itself, so it can be answered.
+  await hint.press({ key: 'quick:scripts/ask.py' })
+  expect(seen.opened).toEqual(['scripts'])
+  expect(seen.spawned.at(-1)?.slice(-1)).toEqual(['scripts/ask.py'])
+  const shown = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(100)
+  await shown.input({ key: 'answer', text: 'ok' })
+  await clock.advance(100)
+  await shown.unmount()
+  await hint.unmount()
 })

@@ -51,6 +51,8 @@ const showAll = atom({ plugin: 'script-menu', key: 'showAll' } as const, false)
 const listOffset = atom({ plugin: 'script-menu', key: 'listOffset' } as const, 0)
 const closedByHand = atom({ plugin: 'script-menu', key: 'closedByHand' } as const, false)
 
+// Favourites past this many under the prompt are a `+n` that opens the pane.
+const MAX_QUICK = 5
 // The scrolling list never shrinks below this many rows, whatever room is left.
 const MIN_WINDOW = 3
 
@@ -213,7 +215,18 @@ async function inspectFiles($: Engine, root: string, files: readonly string[]): 
   return found
 }
 
-async function scanProject($: Engine): Promise<void> {
+let scanning: Promise<void> | undefined
+
+/** Scans the project; a scan asked for while one runs joins it. */
+function scanProject($: Engine): Promise<void> {
+  scanning ??= scanAll($).finally(() => {
+    scanning = undefined
+  })
+
+  return scanning
+}
+
+async function scanAll($: Engine): Promise<void> {
   const root = await $.session.root()
   await update($, scan, (now): Scan => ({ ...now, status: 'scanning', root, message: undefined }))
   venvCache.clear()
@@ -369,11 +382,20 @@ async function finish($: Engine, path: string, id: string, ended: ProcessSpawnRe
 
     return { ...all, [path]: finished }
   })
-  if (finished !== undefined && endedAt - finished.startedAt > TOAST_AFTER_MS) {
+  if (finished === undefined) return
+  // A run out of sight (started from the hint line, say) always says how it ended.
+  if (endedAt - finished.startedAt > TOAST_AFTER_MS || !(await isInView($, path))) {
     const name = path.slice(path.lastIndexOf('/') + 1)
     const said = { done: 'er ferdig', failed: `feilet (kode ${finished.code})`, stopped: 'ble stoppet', running: '' }
     $.ui.toast(`${name} ${said[finished.status]}`)
   }
+}
+
+/** Whether the pane is up and showing this script's output. */
+async function isInView($: Engine, path: string): Promise<boolean> {
+  if ((await read($, selected)) !== path) return false
+
+  return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isShown)
 }
 
 async function startRun($: Engine, path: string, argsText: string, isRemembered = true): Promise<void> {
@@ -552,6 +574,40 @@ async function openBeside($: Engine, surface: string, viewport?: RenderViewport)
   if (await read($, closedByHand)) return
   if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
   await showPane($)
+}
+
+/**
+ * A favourite's button under the prompt: runs it out of sight with its last
+ * arguments. One that is running, asks for input or needs a terminal is shown
+ * where that can happen instead: the pane, or Terminal.
+ */
+async function quickRun($: Engine, path: string): Promise<void> {
+  const script = await scriptFor($, path)
+  if (script.needsTerminal) return openInTerminal($, path)
+  const isRunning = (await read($, runs))[path]?.status === 'running'
+  if (isRunning || script.asksInput || script.asksSecret) {
+    await select($, path)
+    await openPane($)
+  }
+  if (!isRunning) void startRun($, path, await currentArgs($, path))
+}
+
+/** Shows the pane on the person's word, whatever closed it before. */
+async function openPane($: Engine): Promise<void> {
+  await update($, closedByHand, () => false)
+  const opened = await showPane($)
+  if (!opened.isPlaced) $.ui.toast(`Script-panelet fikk ikke plass ennå: ${opened.reason}`)
+}
+
+/** The hint line's button: shows the pane, or closes it while it is up. */
+async function togglePane($: Engine): Promise<void> {
+  if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
+    await update($, closedByHand, () => true)
+    await $.ui.close({ id: PANE })
+
+    return
+  }
+  await openPane($)
 }
 
 // ---- the hooks -----------------------------------------------------------
@@ -927,6 +983,60 @@ export const register: Register = on => {
             />
           </Box>
         )}
+      </Box>
+    )
+  })
+
+  // The hint line under the prompt: a button for the pane, then one per
+  // favourite that runs it, the engine's own line kept after them.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const own = await next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const [now, list, saved, all] = await Promise.all([read($, scan), read($, scripts), read($, prefs), read($, runs)])
+    // The favourites come with the scan: the line's first drawing starts one.
+    if (now.status === 'idle') void scanProject($)
+    const running = Object.values(all).filter(run => run.status === 'running')
+    const isWaiting = running.some(run => pendingPrompt(run) !== '')
+    const favourites = list
+      .filter(one => saved.starred.includes(one.path))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    const shown = favourites.slice(0, MAX_QUICK)
+
+    const quick = (script: Script) => {
+      const status = all[script.path]?.status
+      const mark = status === 'running' ? '●' : status === 'done' ? '✓' : status === 'failed' ? '✗' : '▶'
+
+      return (
+        <Button
+          key={`quick:${script.path}`}
+          plain
+          dimColor={status === undefined || status === 'stopped'}
+          label={`${mark} ${script.name}`}
+          onPress={() => quickRun($, script.path)}
+        />
+      )
+    }
+
+    return (
+      <Box flexDirection="row" gap={1}>
+        <Button key="scripts-toggle" plain dimColor label="☰ Scripts" onPress={() => togglePane($)} />
+        {running.length > 0 && (
+          <Text color="warning">{isWaiting ? 'venter på svar' : `${running.length} kjører`}</Text>
+        )}
+        {shown.map(quick)}
+        {favourites.length > shown.length && (
+          <Button
+            key="scripts-more"
+            plain
+            dimColor
+            label={`+${favourites.length - shown.length}`}
+            onPress={async () => {
+              await select($, null)
+              await openPane($)
+            }}
+          />
+        )}
+        {own}
       </Box>
     )
   })

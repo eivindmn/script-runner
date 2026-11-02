@@ -25,7 +25,14 @@ In the desktop app, where `/plugin` doesn't run: click + next to the prompt box,
 
 ## Use
 
-In the desktop app the pane opens by itself beside the conversation and lists the project's scripts. Close it and it stays closed for that session. `/scripts` brings it back, and `/scripts <search>` jumps straight to a script. In the terminal, `/scripts` opens it.
+In the desktop app the pane opens by itself beside the conversation and lists the project's scripts. Close it and it stays closed for that session.
+
+Under the prompt box there's a row of small buttons:
+
+- **☰ Scripts** shows or hides the pane. Beside it, a note says when a script is running or waiting for an answer.
+- **One button per favourite** (up to five, then `+n`) runs it with its last arguments. It runs out of sight and a toast says how it ended; the button shows `●` while it runs, then `✓` or `✗`. A script that asks for input opens the pane so you can answer, and one that needs a real terminal opens in Terminal.
+
+`/scripts` also brings the pane back, and `/scripts <search>` jumps straight to a script.
 
 - **▶ / ■** starts and stops a script. It runs from the project root, and the first line of its output is the exact command.
 - **Arguments** are remembered per script. **--help** runs the script with `--help` when it has argparse, click, typer, getopts or a usage text.
