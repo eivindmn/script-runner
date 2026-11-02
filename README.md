@@ -25,11 +25,13 @@ In the desktop app, where `/plugin` doesn't run: click + next to the prompt box,
 
 ## Use
 
-Type `/scripts` to open the pane, or `/scripts <search>` to jump straight to a script.
+In the desktop app the pane opens by itself beside the conversation and lists the project's scripts. Close it and it stays closed for that session. `/scripts` brings it back, and `/scripts <search>` jumps straight to a script. In the terminal, `/scripts` opens it.
 
 - **▶ / ■** starts and stops a script. It runs from the project root, and the first line of its output is the exact command.
 - **Arguments** are remembered per script. **--help** runs the script with `--help` when it has argparse, click, typer, getopts or a usage text.
-- **☆ / ★** stars a script. Starred scripts sit at the top, and stars are kept per project.
+- **☆ / ★** stars a script. Starred scripts stay at the top, and stars are kept per project.
+- **A long list** scrolls under the favourites, with the mouse wheel or ▲ ▼, so the favourites never scroll away.
+- **↻ Oppdater** scans the project again, for scripts added since.
 - **Answers while it runs:** when a script asks for input (`input()`, `getpass`, `read -p`, click/typer prompts), the prompt shows in the pane with a field under it. Type and press Enter, and the line goes to the script's stdin. Passwords aren't echoed.
 - **Åpne i Terminal** opens the script in Terminal.app instead, for scripts that need a real terminal (curses, fzf, dialog, questionary and the like). The pane warns you about these.
 - **Spør Claude om feilen** puts the end of a failed run's output in the prompt box, so you can ask Claude about it.

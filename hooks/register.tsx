@@ -1,5 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ProcessSpawnChunk, ProcessSpawnResult, Register, Timer } from 'claude-code'
+import type {
+  EngineInterface,
+  ProcessSpawnChunk,
+  ProcessSpawnResult,
+  Register,
+  RenderViewport,
+  Timer,
+  UiOpenResult,
+} from 'claude-code'
 
 import type { OutputLine, Prefs, Run, Scan, Script } from '../types'
 import {
@@ -40,6 +48,16 @@ const drafts = atom({ plugin: 'script-menu', key: 'drafts' } as const, {})
 const selected = atom({ plugin: 'script-menu', key: 'selected' } as const, null)
 const filter = atom({ plugin: 'script-menu', key: 'filter' } as const, '')
 const showAll = atom({ plugin: 'script-menu', key: 'showAll' } as const, false)
+const listOffset = atom({ plugin: 'script-menu', key: 'listOffset' } as const, 0)
+const closedByHand = atom({ plugin: 'script-menu', key: 'closedByHand' } as const, false)
+
+// The scrolling list never shrinks below this many rows, whatever room is left.
+const MIN_WINDOW = 3
+
+/** Where the list's window sat in the last drawing of the menu; unset in the detail view. */
+type ListArea = { top: number; size: number; total: number; paneOffset: number }
+
+let listArea: ListArea | undefined
 
 /** A child the module is reading from now; gone with a reload, which kills it. */
 type Live = {
@@ -508,13 +526,41 @@ async function select($: Engine, path: string | null): Promise<void> {
   if (path !== null) await ensureInspected($, path)
 }
 
+/** Moves the list's window by `by` rows, kept inside the list. */
+async function moveList($: Engine, by: number): Promise<void> {
+  const area = listArea
+  if (area === undefined) return
+  const last = Math.max(0, area.total - area.size)
+  await update($, listOffset, offset => Math.max(0, Math.min(last, Math.min(offset, last) + by)))
+}
+
+/** Opens the pane and scans when the project has not been scanned yet. */
+async function showPane($: Engine): Promise<UiOpenResult> {
+  const [root, now] = await Promise.all([$.session.root(), read($, scan)])
+  const opened = await $.ui.open({ id: PANE, title: 'Scripts' })
+  if (now.status === 'idle' || now.status === 'failed' || now.root !== root) void scanProject($)
+
+  return opened
+}
+
+/**
+ * Opens the pane unasked where the surface docks it beside the transcript, so
+ * the scripts are always at hand; never once the person has closed it.
+ */
+async function openBeside($: Engine, surface: string, viewport?: RenderViewport): Promise<void> {
+  if (surface === 'terminal' || surface === 'mobile' || viewport?.isFullscreen === false) return
+  if (await read($, closedByHand)) return
+  if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
+  await showPane($)
+}
+
 // ---- the hooks -----------------------------------------------------------
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'scripts',
-      description: 'Åpne script-menyen: kjør Python- og shell-scriptene i prosjektet',
+      description: 'Vis script-panelet: kjør Python- og shell-scriptene i prosjektet',
       argumentHint: '[søk]',
     })
     // A reload killed whatever the previous copy of the module was running.
@@ -532,8 +578,37 @@ export const register: Register = on => {
 
       return fixed
     })
+    const result = await next(e)
+    // A surface that attached before the module loaded raises no attach of its own.
+    for (const surface of await $.session.surfaces()) void openBeside($, surface)
+
+    return result
+  })
+
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    void openBeside($, e.surface, e.viewport)
+
+    return result
+  })
+
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person') await update($, closedByHand, () => true)
 
     return next(e)
+  })
+
+  // The wheel over the list moves the list, under favourites that stay put.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const area = listArea
+    if (area === undefined || area.total <= area.size) return next(e)
+    const row = e.pointer === undefined ? undefined : e.pointer.row + area.paneOffset
+    const isOverList =
+      row === undefined ? e.contentRows <= e.bodyRows : row >= area.top && row <= area.top + area.size
+    if (!isOverList) return next(e)
+    await moveList($, e.by)
+
+    return {}
   })
 
   on('command.run', { command: 'scripts' }, async ($, e) => {
@@ -542,6 +617,8 @@ export const register: Register = on => {
     const now = await read($, scan)
     const isStale = now.status === 'idle' || now.status === 'failed' || now.root !== root
     await update($, filter, () => query)
+    await update($, listOffset, () => 0)
+    await update($, closedByHand, () => false)
     if (query !== '' && !isStale) {
       const q = query.toLowerCase()
       const matches = (await read($, scripts)).filter(one => one.path.toLowerCase().includes(q))
@@ -549,17 +626,16 @@ export const register: Register = on => {
     } else if (query !== '') {
       await select($, null)
     }
-    const opened = await $.ui.open({ id: PANE, title: 'Scripts' })
-    if (isStale) void scanProject($)
+    const opened = await showPane($)
 
-    return opened.isPlaced ? {} : { text: `Script-menyen fikk ikke plass ennå: ${opened.reason}` }
+    return opened.isPlaced ? {} : { text: `Script-panelet fikk ikke plass ennå: ${opened.reason}` }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Button, Text } = elements
     const Input = 'Input' in elements ? elements.Input : undefined
-    const [now, list, saved, all, chosen, query, isAll, draft] = await Promise.all([
+    const [now, list, saved, all, chosen, query, isAll, draft, offset] = await Promise.all([
       read($, scan),
       read($, scripts),
       read($, prefs),
@@ -568,6 +644,7 @@ export const register: Register = on => {
       read($, filter),
       read($, showAll),
       read($, drafts),
+      read($, listOffset),
     ])
     const starred = new Set(saved.starred)
 
@@ -598,6 +675,7 @@ export const register: Register = on => {
 
     // ---- one script, its arguments and its output
     if (chosen !== null) {
+      listArea = undefined
       const script = list.find(one => one.path === chosen) ?? bareScript(chosen)
       const path = script.path
       const run = all[path]
@@ -738,6 +816,27 @@ export const register: Register = on => {
     const favourites = shown.filter(one => starred.has(one.path)).sort((a, b) => a.name.localeCompare(b.name))
     const others = shown.filter(one => !starred.has(one.path))
     const likelyCount = list.filter(one => one.isLikely).length
+    const hasSearch = Input !== undefined && list.length > 8
+    const hasShowAll = now.status === 'done' && list.length > likelyCount
+    const isEmpty = now.status === 'done' && shown.length === 0
+
+    // The favourites stay put and the rest scroll in a window under them. Each
+    // script is one row, so the rows around the window are counted (a margin a
+    // row) and the window fills what is left of the pane.
+    const above =
+      1 +
+      (now.root !== '' ? 1 : 0) +
+      (now.status === 'scanning' || now.status === 'failed' ? 1 : 0) +
+      (hasSearch ? 2 : 0) +
+      (favourites.length > 0 ? 2 + favourites.length : 0) +
+      (others.length > 0 ? (favourites.length > 0 ? 2 : 1) : 0)
+    const below = (hasShowAll ? 2 : 0) + (isEmpty ? 2 : 0)
+    const room = e.props.scroll.bodyRows - above - below
+    // A window short of the whole list gives a row to its ▲ ▼ line.
+    const size = others.length <= room ? others.length : Math.max(MIN_WINDOW, room - 1)
+    const first = Math.max(0, Math.min(offset, others.length - size))
+    const visible = others.slice(first, first + size)
+    listArea = { top: above, size, total: others.length, paneOffset: e.props.scroll.offset }
 
     const row = (script: Script) => (
       <Box key={`row:${script.path}`} flexDirection="row" gap={1}>
@@ -773,14 +872,17 @@ export const register: Register = on => {
         )}
         {now.status === 'scanning' && <Text dimColor>Leter etter scripts…</Text>}
         {now.status === 'failed' && <Text color="error">Skanningen feilet: {now.message ?? ''}</Text>}
-        {Input !== undefined && list.length > 8 && (
+        {hasSearch && Input !== undefined && (
           <Box marginTop={1}>
             <Input
               key="filter"
               label="Søk "
               placeholder="navn, mappe eller beskrivelse"
               value={query}
-              onInput={value => update($, filter, () => value)}
+              onInput={async value => {
+                await update($, filter, () => value)
+                await update($, listOffset, () => 0)
+              }}
               onSubmit={value => update($, filter, () => value)}
             />
           </Box>
@@ -794,24 +896,34 @@ export const register: Register = on => {
         {others.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             {favourites.length > 0 && <Text bold>Alle scripts</Text>}
-            {others.map(row)}
+            {visible.map(row)}
+            {size < others.length && (
+              <Box flexDirection="row" gap={1}>
+                <Button key="list-up" plain dimColor label="▲" onPress={() => moveList($, -size)} />
+                <Button key="list-down" plain dimColor label="▼" onPress={() => moveList($, size)} />
+                <Text dimColor>{`${first + 1}–${first + visible.length} av ${others.length}`}</Text>
+              </Box>
+            )}
           </Box>
         )}
-        {now.status === 'done' && shown.length === 0 && (
+        {isEmpty && (
           <Box marginTop={1}>
             <Text dimColor>
               {q !== '' ? `Ingen treff på «${query.trim()}».` : 'Fant ingen scripts her.'}
             </Text>
           </Box>
         )}
-        {now.status === 'done' && list.length > likelyCount && (
+        {hasShowAll && (
           <Box marginTop={1}>
             <Button
               key="show-all"
               plain
               dimColor
               label={isAll ? 'Vis bare kjørbare scripts' : `Vis alle filer (${list.length})`}
-              onPress={() => update($, showAll, value => !value)}
+              onPress={async () => {
+                await update($, showAll, value => !value)
+                await update($, listOffset, () => 0)
+              }}
             />
           </Box>
         )}

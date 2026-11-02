@@ -93,6 +93,10 @@ declare module 'claude-code' {
       selected: string | null
       filter: string
       showAll: boolean
+      /** The first row of the scrolling list, under the favourites. */
+      listOffset: number
+      /** The person closed the pane: it is not opened again unasked this session. */
+      closedByHand: boolean
     }
   }
 }

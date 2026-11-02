@@ -32,8 +32,9 @@ const PANE = {
   },
 } as const
 
-/** The engine beneath the mod: a repo of three files, a shell and a clock. */
-function world(on: On) {
+/** The engine beneath the mod: a repo of a few files, a shell and a clock. */
+function world(on: On, extra: Record<string, string> = {}) {
+  const files: Record<string, string> = { ...FILES, ...extra }
   const clock = mock.clock(on, { now: 1000 })
   const stored = new Map<string, unknown>()
   on('store.get', (_, e) => ({ value: stored.get(e.key) }))
@@ -46,10 +47,20 @@ function world(on: On) {
     spawned: [] as (readonly string[])[],
     envs: [] as (Record<string, string> | undefined)[],
     answers: [] as string[],
+    opened: [] as string[],
   }
   on('session.root', () => ({ value: ROOT }))
+  on('session.surfaces', () => ({ value: [] }))
+  on('session.attach', (_, e) => ({ clientId: e.clientId }))
   on('command.register', () => ({ value: { command: 'scripts' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    seen.opened.push(e.id)
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.panes', () => ({
+    value: [...new Set(seen.opened)].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+  }))
   on('fs.list', (_, e) =>
     e.path === `${ROOT}/pipeline`
       ? { value: [{ name: '.venv', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false }] }
@@ -57,7 +68,7 @@ function world(on: On) {
   )
   on('fs.exists', (_, e) => ({ value: e.path === `${VENV}/bin/python` }))
   on('fs.read', (_, e) => {
-    const file = FILES[String(e.path).slice(ROOT.length + 1)]
+    const file = files[String(e.path).slice(ROOT.length + 1)]
 
     return file === undefined ? { deny: 'ENOENT' } : { value: file }
   })
@@ -66,7 +77,7 @@ function world(on: On) {
     const ok = (stdout: string) => ({
       value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     })
-    if (command === 'git') return ok(`${Object.keys(FILES).join('\0')}\0`)
+    if (command === 'git') return ok(`${Object.keys(files).join('\0')}\0`)
     if (command === '/bin/zsh') return ok('/usr/bin:/bin\n/usr/bin/python3\n')
     if (command === 'mktemp') return ok('/tmp/script-menu.x\n')
     if (command === '/bin/sh') {
@@ -198,5 +209,63 @@ test('a surface without text fields still lists and runs', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
   await ui.press({ key: 'rescan' })
   expect(await ui.find({ key: 'run:scripts/deploy.py' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the pane opens by itself beside the transcript on the desktop, and scans', async ($, on) => {
+  const { clock, seen } = world(on)
+  await $.session.attach({ surface: 'mobile', clientId: 'mobile:default', viewport: { columns: 40, rows: 30, isFullscreen: false } })
+  await clock.advance(10)
+  expect(seen.opened).toEqual([])
+
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default', viewport: { columns: 60, rows: 40, isFullscreen: true } })
+  await clock.advance(10)
+  expect(seen.opened).toEqual(['scripts'])
+
+  // Scanned unasked: the list is there without pressing ↻.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'open:scripts/deploy.py' })).toBeDefined()
+  await ui.unmount()
+
+  // Already open: a second client does not open it again.
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:two', viewport: { columns: 60, rows: 40, isFullscreen: true } })
+  await clock.advance(10)
+  expect(seen.opened).toEqual(['scripts'])
+})
+
+test('a long list scrolls in a window under the favourites', async ($, on) => {
+  const jobs = Object.fromEntries(
+    Array.from({ length: 12 }, (_, i) => [`scripts/job${String(i + 1).padStart(2, '0')}.py`, 'print(1)\n']),
+  )
+  world(on, jobs)
+  // 16 rows: 11 go to the header, search, favourites and footer, 5 to the list and its ▲ ▼ line.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: { ...PANE.props, scroll: { offset: 0, bodyRows: 16 } } })
+  await ui.press({ key: 'rescan' })
+  await ui.press({ key: 'star:scripts/deploy.py' })
+
+  const showing = async () => {
+    const keys: string[] = []
+    for (const path of [...Object.keys(FILES), ...Object.keys(jobs)]) {
+      if (path === 'scripts/deploy.py') continue
+      if ((await ui.find({ key: `open:${path}` })) !== undefined) keys.push(path)
+    }
+
+    return keys
+  }
+  const before = await showing()
+  expect(before.length).toBe(4)
+  expect(await ui.find({ type: 'Text', text: /^1–4 av 16$/ })).toBeDefined()
+
+  await ui.press({ key: 'list-down' })
+  const after = await showing()
+  expect(after.length).toBe(4)
+  expect(after.some(path => before.includes(path))).toBe(false)
+  expect(await ui.find({ type: 'Text', text: /^5–8 av 16$/ })).toBeDefined()
+  // The favourite stays at the top whatever the list shows.
+  expect(await ui.find({ key: 'open:scripts/deploy.py' })).toBeDefined()
+
+  await ui.press({ key: 'list-up' })
+  await ui.press({ key: 'list-up' })
+  expect(await showing()).toEqual(before)
   await ui.unmount()
 })
